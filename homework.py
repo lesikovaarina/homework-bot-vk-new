@@ -8,6 +8,8 @@ import requests
 import vk_api
 from dotenv import load_dotenv
 
+from exceptions import EndpointStatusError, MissingTokenError
+
 
 load_dotenv()
 
@@ -30,26 +32,27 @@ HOMEWORK_VERDICTS = {
 
 def check_tokens():
     """Проверяет доступность переменных окружения."""
-    if not PRACTICUM_TOKEN:
+    tokens = (
+        ('PRACTICUM_TOKEN', PRACTICUM_TOKEN),
+        ('VK_TOKEN', VK_TOKEN),
+        ('VK_USER_ID', VK_USER_ID),
+    )
+    missing = []
+    for name, value in tokens:
+        if not value:
+            missing.append(name)
+    if missing:
+        names = ', '.join(missing)
         logging.critical(
-            'Отсутствует обязательная переменная окружения: PRACTICUM_TOKEN'
+            f'Отсутствуют обязательные переменные окружения: {names}'
         )
-        return False
-    if not VK_TOKEN:
-        logging.critical(
-            'Отсутствует обязательная переменная окружения: VK_TOKEN'
-        )
-        return False
-    if not VK_USER_ID:
-        logging.critical(
-            'Отсутствует обязательная переменная окружения: VK_USER_ID'
-        )
-        return False
-    return True
+        raise MissingTokenError(f'Нет переменных окружения: {names}')
+    logging.debug('Все переменные окружения на месте')
 
 
 def send_message(vk, message):
     """Отправляет сообщение в ВК."""
+    logging.debug(f'Начало отправки сообщения в ВК: "{message}"')
     try:
         vk.messages.send(
             user_id=VK_USER_ID,
@@ -66,6 +69,7 @@ def send_message(vk, message):
 
 def get_api_answer(timestamp):
     """Делает запрос к API Яндекс Практикума."""
+    logging.debug(f'Начало запроса к API: {timestamp}')
     try:
         response = requests.get(
             ENDPOINT, headers=HEADERS, params={'from_date': timestamp}
@@ -75,9 +79,9 @@ def get_api_answer(timestamp):
             f'Ошибка при запросе к API: {error}'
         ) from error
     if response.status_code != HTTPStatus.OK:
-        raise ConnectionError(
-            f'Эндпоинт {ENDPOINT} недоступен. '
-            f'Код ответа API: {response.status_code}'
+        raise EndpointStatusError(
+            f'Неожиданный код ответа от {ENDPOINT}: '
+            f'{response.status_code} (ожидался {HTTPStatus.OK})'
         )
     return response.json()
 
@@ -92,14 +96,22 @@ def check_response(response):
         raise KeyError('В ответе API отсутствует ключ "homeworks"')
     homeworks = response['homeworks']
     if 'current_date' not in response:
-        raise KeyError('В ответе API отсутствует ключ "current_date"')
+        logging.error('В ответе API отсутствует ключ "current_date"')
     if not isinstance(homeworks, list):
-        raise TypeError('Значение по ключу "homeworks" не является списком')
+        raise TypeError(
+            'Значение по ключу "homeworks" не является списком. '
+            f'Получен {type(homeworks)}'
+        )
     return homeworks
 
 
 def parse_status(homework):
     """Извлекает статус домашней работы."""
+    if not isinstance(homework, dict):
+        raise TypeError(
+            'Элемент списка "homeworks" не является словарем. '
+            f'Получен {type(homework)}'
+        )
     if 'homework_name' not in homework:
         raise KeyError('В ответе API нет ключа "homework_name"')
     if 'status' not in homework:
@@ -114,8 +126,7 @@ def parse_status(homework):
 
 def main():
     """Основная логика работы бота."""
-    if not check_tokens():
-        sys.exit('Программа принудительно остановлена.')
+    check_tokens()
     # Создаем сессию для бота
     vk_session = vk_api.VkApi(token=VK_TOKEN)
     vk = vk_session.get_api()
@@ -126,10 +137,12 @@ def main():
         try:
             get_api_answer_response = get_api_answer(timestamp)
             homeworks = check_response(get_api_answer_response)
-            timestamp = get_api_answer_response['current_date']
             if homeworks:
                 message = parse_status(homeworks[0])
-                send_message(vk, message)
+                if send_message(vk, message):
+                    timestamp = get_api_answer_response.get(
+                        'current_date', timestamp
+                    )
             else:
                 logging.debug('Новых статусов нет')
         except Exception as error:
@@ -148,4 +161,7 @@ if __name__ == '__main__':
         format='%(asctime)s [%(levelname)s] %(message)s',
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-    main()
+    try:
+        main()
+    except MissingTokenError as error:
+        sys.exit(f'Программа принудительно остановлена. {error}')
